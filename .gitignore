@@ -17,3 +17,5 @@ log/
 py-bindings/ompl/app/
 py-bindings/ompl/bindings_generator.py
 !py-bindings/ompl/bindings_generator.py.in
+figures/
+logs/

@@ -38,236 +38,278 @@
 #include <ompl/base/goals/GoalState.h>
 #include <ompl/base/spaces/SE2StateSpace.h>
 #include <ompl/control/spaces/RealVectorControlSpace.h>
-#include <ompl/control/planners/kpiece/KPIECE1.h>
 #include <ompl/control/planners/rrt/RRT.h>
-#include <ompl/control/planners/est/EST.h>
-#include <ompl/control/planners/syclop/SyclopRRT.h>
-#include <ompl/control/planners/syclop/SyclopEST.h>
-#include <ompl/control/planners/pdst/PDST.h>
-#include <ompl/control/planners/syclop/GridDecomposition.h>
-#include <ompl/control/SimpleSetup.h>
+#include <ompl/control/planners/sst/SST.h>
+#include <ompl/base/objectives/PathLengthOptimizationObjective.h>
 #include <ompl/config.h>
 #include <iostream>
+#include <iomanip>
+#include <chrono>
+#include <vector>
+#include <Eigen/Dense>
+#include <ompl/base/Goal.h>
+#include <ompl/base/StateSpace.h>
 
 namespace ob = ompl::base;
 namespace oc = ompl::control;
 
-// a decomposition is only needed for SyclopRRT and SyclopEST
-class MyDecomposition : public oc::GridDecomposition
+// A GoalRegion that uses custom weights (w_pose, w_vel) only for the goal check.
+class GoalWeighted : public ob::GoalRegion
 {
 public:
-    MyDecomposition(const int length, const ob::RealVectorBounds& bounds)
-        : GridDecomposition(length, 2, bounds)
+    GoalWeighted(const ob::SpaceInformationPtr &si,
+                 const ob::ScopedState<ob::CompoundStateSpace> &goalState,
+                 double tol, double w_pose, double w_vel)
+      : GoalRegion(si), goal_(goalState), tol_(tol),
+        w_pose_(w_pose), w_vel_(w_vel)
     {
-    }
-    void project(const ob::State* s, std::vector<double>& coord) const override
-    {
-        coord.resize(2);
-        coord[0] = s->as<ob::SE2StateSpace::StateType>()->getX();
-        coord[1] = s->as<ob::SE2StateSpace::StateType>()->getY();
+        // Goal is satisfied when distanceGoal < threshold_
+        setThreshold(0.0);
     }
 
-    void sampleFullState(const ob::StateSamplerPtr& sampler, const std::vector<double>& coord, ob::State* s) const override
+    // Override to use our own weighted metric
+    double distanceGoal(const ob::State *s) const override
     {
-        sampler->sampleUniform(s);
-        s->as<ob::SE2StateSpace::StateType>()->setXY(coord[0], coord[1]);
+        // 1) unravel the compound state
+        const auto *cs = s->as<ob::CompoundStateSpace::StateType>();
+        auto *se2_s  = cs->as<ob::SE2StateSpace::StateType>(0);
+        auto *vel_s  = cs->as<ob::RealVectorStateSpace::StateType>(1);
+
+        const auto *csG = goal_.get();
+        auto *se2_g  = csG->as<ob::SE2StateSpace::StateType>(0);
+        auto *vel_g  = csG->as<ob::RealVectorStateSpace::StateType>(1);
+
+        // 2) compute pose error
+        double dx = se2_s->getX() - se2_g->getX();
+        double dy = se2_s->getY() - se2_g->getY();
+        double dth = se2_s->getYaw() - se2_g->getYaw();
+
+        // 3) compute vel error
+        double dv = vel_s->values[0] - vel_g->values[0];
+        double domega = vel_s->values[1] - vel_g->values[1];
+
+        // 4) weighted combination
+        double metric = std::sqrt(w_pose_ * (dx * dx + dy * dy + dth * dth) + 
+                                  w_vel_ * (dv * dv + domega * domega));
+        
+        std::cout << "metric = " << metric << std::endl;
+
+        return metric - tol_;
     }
+
+private:
+    ob::ScopedState<ob::CompoundStateSpace> goal_;
+    double tol_, w_pose_, w_vel_;
+};
+
+
+struct AABB
+{
+    Eigen::Vector2d min, max;
+    bool contains(const Eigen::Vector2d &p) const
+    {
+        return (p.x() >= min.x() && p.x() <= max.x()) &&
+               (p.y() >= min.y() && p.y() <= max.y());
+    }
+};
+
+// Your allowed boxes and bodyPoints remain unchanged:
+static const std::vector<AABB> allowedBoxes = {
+    {{-0.414912, -0.933520}, {1.756473, -0.459736}},
+    {{-0.440026, -0.479736}, {2.079724, 0.038077}},
+    {{-0.452385, 0.018077}, {2.080080, 0.507299}},
+    {{-0.459443, 0.487299}, {0.452835, 0.989674}}
+};
+
+static const std::vector<Eigen::Vector2d> bodyPoints = {
+    {-0.2545, 0.381},
+    {-0.2545, -0.381},
+    {1.16417, 0.381},
+    {1.16417, -0.381}
 };
 
 bool isStateValid(const oc::SpaceInformation *si, const ob::State *state)
 {
-    //    ob::ScopedState<ob::SE2StateSpace>
-    // cast the abstract state type to the type we expect
-    const auto *se2state = state->as<ob::SE2StateSpace::StateType>();
-
-    // extract the first component of the state and cast it to what we expect
-    const auto *pos = se2state->as<ob::RealVectorStateSpace::StateType>(0);
-
-    // extract the second component of the state and cast it to what we expect
-    const auto *rot = se2state->as<ob::SO2StateSpace::StateType>(1);
-
-    // check validity of state defined by pos & rot
-
-
-    // return a value that is always true but uses the two variables we define, so we avoid compiler warnings
-    return si->satisfiesBounds(state) && (const void*)rot != (const void*)pos;
+    const auto *se2 = state->as<ob::SE2StateSpace::StateType>();
+    double x   = se2->getX(), y = se2->getY(), yaw = se2->getYaw();
+    Eigen::Rotation2Dd R(yaw);
+    for (auto &pt_body : bodyPoints)
+    {
+        Eigen::Vector2d w = R * pt_body + Eigen::Vector2d(x,y);
+        bool insideAny = false;
+        for (auto &box : allowedBoxes)
+            if (box.contains(w)) { insideAny = true; break; }
+        if (!insideAny)
+            return false;
+    }
+    return si->satisfiesBounds(state);
 }
 
-void propagate(const ob::State *start, const oc::Control *control, const double duration, ob::State *result)
+void propagate(const ob::State *start, const oc::Control *control,
+               const double duration, ob::State *result)
 {
-    const auto *se2state = start->as<ob::SE2StateSpace::StateType>();
-    const double* pos = se2state->as<ob::RealVectorStateSpace::StateType>(0)->values;
-    const double rot = se2state->as<ob::SO2StateSpace::StateType>(1)->value;
-    const double* ctrl = control->as<oc::RealVectorControlSpace::ControlType>()->values;
+    // 1) Read current state and control values
+    const auto *state = start->as<ob::CompoundStateSpace::StateType>();
 
-    result->as<ob::SE2StateSpace::StateType>()->setXY(
-        pos[0] + ctrl[0] * duration * cos(rot),
-        pos[1] + ctrl[0] * duration * sin(rot));
-    result->as<ob::SE2StateSpace::StateType>()->setYaw(
-        rot    + ctrl[1] * duration);
+    const auto *pos = state->as<ob::SE2StateSpace::StateType>(0);
+    double x = pos->getX(), y = pos->getY(), yaw = pos->getYaw();
+
+    const auto *vel = state->as<ob::RealVectorStateSpace::StateType>(1);
+    double v = vel->values[0], omega = vel->values[1];
+
+    const auto *acc = control->as<oc::RealVectorControlSpace::ControlType>();
+    double a = acc->values[0], alpha = acc->values[1];
+
+    // 2) Propagation
+    double x_new = x + (v * duration + 0.5 * a * duration * duration) * cos(yaw);
+    double y_new = y + (v * duration + 0.5 * a * duration * duration) * sin(yaw);
+    double yaw_new = yaw + omega * duration + 0.5 * alpha * duration * duration;
+    double v_new = v + a * duration;
+    double omega_new = omega + alpha * duration;
+
+    std::cout << std::fixed << std::setprecision(4);
+    std::cout << "Before Propagation:" << " x = " << x << " y = " << y << " yaw = " << yaw
+              << " v = " << v << " omega = " << omega << std::endl;
+    std::cout << "Propagation Acceleration:" << " a = " << a << " alpha = " << alpha << std::endl;
+    std::cout << "After Propagation:" << " x = " << x_new << " y = " << y_new << " yaw = " << yaw_new
+              << " v = " << v_new << " omega = " << omega_new << std::endl;
+    std::cout << std::endl;
+
+    // 3) Write into result
+    auto *state_new = result->as<ob::CompoundStateSpace::StateType>();
+
+    auto *pos_new = state_new->as<ob::SE2StateSpace::StateType>(0);
+    pos_new->setX(x_new);
+    pos_new->setY(y_new);
+    pos_new->setYaw(yaw_new);
+
+    auto *vel_new = state_new->as<ob::RealVectorStateSpace::StateType>(1);
+    vel_new->values[0] = v_new;
+    vel_new->values[1] = omega_new;
 }
 
 void plan()
 {
+    // 1) Set state and control spaces
+    // set position space, including (x, y, yaw)
+    auto pos_space(std::make_shared<ob::SE2StateSpace>());
+    ob::RealVectorBounds pos_bounds(2);
+    pos_bounds.setLow(0, 0.0); pos_bounds.setHigh(0, 1.0); // x position bound [0, 1]
+    pos_bounds.setLow(1, 0.0); pos_bounds.setHigh(1, 1.0); // y position bound [0, 1]
+    pos_space->setBounds(pos_bounds);
 
-    // construct the state space we are planning in
-    auto space(std::make_shared<ob::SE2StateSpace>());
+    // set velocity space, including (v, omega)
+    auto vel_space(std::make_shared<ob::RealVectorStateSpace>(2));
+    ob::RealVectorBounds vel_bounds(2);
+    vel_bounds.setLow(0, 0.0); vel_bounds.setHigh(0, 4.0);  // linear velocity bound [0, 4.0]
+    vel_bounds.setLow(1, -1.5); vel_bounds.setHigh(1, 1.5); // angular velocity bound [-3.0, 3.0]
+    vel_space->setBounds(vel_bounds);
 
-    // set the bounds for the R^2 part of SE(2)
-    ob::RealVectorBounds bounds(2);
-    bounds.setLow(-1);
-    bounds.setHigh(1);
+    // set general state space, including pos_space and vel_space
+    auto space(std::make_shared<ob::CompoundStateSpace>());
+    space->addSubspace(pos_space, 1.0);
+    space->addSubspace(vel_space, 1.0);
+    space->lock();
 
-    space->setBounds(bounds);
-
-    // create a control space
+    // set control (acceleration) space, including (a, alpha)
     auto cspace(std::make_shared<oc::RealVectorControlSpace>(space, 2));
-
-    // set the bounds for the control space
     ob::RealVectorBounds cbounds(2);
-    cbounds.setLow(-0.3);
-    cbounds.setHigh(0.3);
-
+    cbounds.setLow(0, -1.5); cbounds.setHigh(0, 1.5); // linear acceleration bound [-1.5, 1.5]
+    cbounds.setLow(1, -3.0); cbounds.setHigh(1, 3.0); // angular acceleration bound [-1.5, 1.5]
     cspace->setBounds(cbounds);
 
-    // construct an instance of  space information from this control space
+    // 2) SpaceInformation
     auto si(std::make_shared<oc::SpaceInformation>(space, cspace));
-
-    // set state validity checking for this space
+    si->setPropagationStepSize(0.01);
+    // si->setMinMaxControlDuration(1, 1);
     si->setStateValidityChecker(
-        [&si](const ob::State *state) { return isStateValid(si.get(), state); });
-
-    // set the state propagation routine
+        [&](const ob::State *s){ return isStateValid(si.get(), s); }); // bounding box constraints
     si->setStatePropagator(propagate);
 
-    // create a start state
-    ob::ScopedState<ob::SE2StateSpace> start(space);
-    start->setX(-0.5);
-    start->setY(0.0);
-    start->setYaw(0.0);
+    // 3) Start & Goal
+    ob::ScopedState<ob::CompoundStateSpace> start(space), goal(space);
 
-    // create a goal state
-    ob::ScopedState<ob::SE2StateSpace> goal(start);
-    goal->setX(0.5);
+    auto *space_start = start.get();
 
-    // create a problem instance
+    auto *pos_space_start = space_start->as<ob::SE2StateSpace::StateType>(0);
+    pos_space_start->setX(0.0);
+    pos_space_start->setY(0.685);
+    pos_space_start->setYaw(-1.570796);
+
+    auto *vel_space_start = space_start->as<ob::RealVectorStateSpace::StateType>(1);
+    vel_space_start->values[0] = 0.528379;
+    vel_space_start->values[1] = 0.0;
+
+    auto *space_goal = goal.get();
+
+    auto *pos_space_goal = space_goal->as<ob::SE2StateSpace::StateType>(0);
+    pos_space_goal->setX(0.86329);
+    pos_space_goal->setY(0.0);
+    pos_space_goal->setYaw(0.0);
+
+    auto *vel_space_goal = space_goal->as<ob::RealVectorStateSpace::StateType>(1);
+    vel_space_goal->values[0] = 0.930091;
+    vel_space_goal->values[1] = 0.0;
+
+    // 4) ProblemDefinition + Optimization
     auto pdef(std::make_shared<ob::ProblemDefinition>(si));
+    // pdef->setStartAndGoalStates(start, goal, 0.05);
+    pdef->addStartState(start);
+    // customize position and velocity weights
+    {
+        double tol = 0.1, w_pose = 1.0, w_vel = 0.0;
+        auto weighted_goal = std::make_shared<GoalWeighted>(si, goal, tol, w_pose, w_vel);
+        pdef->setGoal(weighted_goal);
+    }
+    auto opt = std::make_shared<ob::PathLengthOptimizationObjective>(si);
+    pdef->setOptimizationObjective(opt);
 
-    // set the start and goal states
-    pdef->setStartAndGoalStates(start, goal, 0.1);
-
-    // create a planner for the defined space
-    //auto planner(std::make_shared<oc::RRT>(si));
-    //auto planner(std::make_shared<oc::EST>(si));
-    //auto planner(std::make_shared<oc::KPIECE1>(si));
-    auto decomp(std::make_shared<MyDecomposition>(32, bounds));
-    auto planner(std::make_shared<oc::SyclopEST>(si, decomp));
-    //auto planner(std::make_shared<oc::SyclopRRT>(si, decomp));
-
-    // set the problem we are trying to solve for the planner
+    // 5) Use SST for near-optimal kinodynamic planning
+    // auto planner(std::make_shared<oc::RRT>(si));
+    auto planner = std::make_shared<oc::SST>(si);
     planner->setProblemDefinition(pdef);
-
-    // perform setup steps for the planner
     planner->setup();
 
-
-    // print the settings for this space
+    // 6) Solve
     si->printSettings(std::cout);
-
-    // print the problem settings
     pdef->print(std::cout);
 
-    // attempt to solve the problem within ten seconds of planning time
-    ob::PlannerStatus solved = planner->ob::Planner::solve(10.0);
-
-    if (solved)
+    ob::PlannerStatus status;
+    const double increment = 0.002;
+    const double max_plan_time = 2.0;
+    double plan_time = 0.0;
+    // Planning incrementally until solver finds a solution or
+    // maximum allowed time is exceeded
+    while (status != ob::PlannerStatus::StatusType::EXACT_SOLUTION)
     {
-        // get the goal representation from the problem definition (not the same as the goal state)
-        // and inquire about the found path
-        ob::PathPtr path = pdef->getSolutionPath();
-        std::cout << "Found solution:" << std::endl;
+        status = planner->ob::Planner::solve(increment);
+        plan_time += increment;
+        if (plan_time > max_plan_time) break;
+    }
 
-        // print the path to screen
+    auto path = pdef->getSolutionPath();
+    if (status == ob::PlannerStatus::StatusType::EXACT_SOLUTION)
+    {
+        std::cout << "Found solution:" << std::endl;
         path->print(std::cout);
+        std::cout << "Planning took " << plan_time << " seconds\n";
+        std::cout << "Planner status: " << status << std::endl;
     }
     else
-        std::cout << "No solution found" << std::endl;
-}
-
-
-void planWithSimpleSetup()
-{
-    // construct the state space we are planning in
-    auto space(std::make_shared<ob::SE2StateSpace>());
-
-    // set the bounds for the R^2 part of SE(2)
-    ob::RealVectorBounds bounds(2);
-    bounds.setLow(-1);
-    bounds.setHigh(1);
-
-    space->setBounds(bounds);
-
-    // create a control space
-    auto cspace(std::make_shared<oc::RealVectorControlSpace>(space, 2));
-
-    // set the bounds for the control space
-    ob::RealVectorBounds cbounds(2);
-    cbounds.setLow(-0.3);
-    cbounds.setHigh(0.3);
-
-    cspace->setBounds(cbounds);
-
-    // define a simple setup class
-    oc::SimpleSetup ss(cspace);
-
-    // set the state propagation routine
-    ss.setStatePropagator(propagate);
-
-    // set state validity checking for this space
-    ss.setStateValidityChecker(
-        [&ss](const ob::State *state) { return isStateValid(ss.getSpaceInformation().get(), state); });
-
-    // create a start state
-    ob::ScopedState<ob::SE2StateSpace> start(space);
-    start->setX(-0.5);
-    start->setY(0.0);
-    start->setYaw(0.0);
-
-    // create a  goal state; use the hard way to set the elements
-    ob::ScopedState<ob::SE2StateSpace> goal(space);
-    (*goal)[0]->as<ob::RealVectorStateSpace::StateType>()->values[0] = 0.0;
-    (*goal)[0]->as<ob::RealVectorStateSpace::StateType>()->values[1] = 0.5;
-    (*goal)[1]->as<ob::SO2StateSpace::StateType>()->value = 0.0;
-
-
-    // set the start and goal states
-    ss.setStartAndGoalStates(start, goal, 0.05);
-
-    // ss.setPlanner(std::make_shared<oc::PDST>(ss.getSpaceInformation()));
-    // ss.getSpaceInformation()->setMinMaxControlDuration(1,100);
-    // attempt to solve the problem within one second of planning time
-    ob::PlannerStatus solved = ss.solve(10.0);
-
-    if (solved)
     {
-        std::cout << "Found solution:" << std::endl;
-        // print the path to screen
-
-        ss.getSolutionPath().printAsMatrix(std::cout);
+        std::cout << "No solution found\n";
+        if (status == ob::PlannerStatus::StatusType::APPROXIMATE_SOLUTION)
+        {
+            std::cout << "Found approximate solution:" << std::endl;
+            path->print(std::cout);
+        }
+        std::cout << "Planner status: " << status << std::endl;
     }
-    else
-        std::cout << "No solution found" << std::endl;
 }
 
-int main(int /*argc*/, char ** /*argv*/)
+int main()
 {
     std::cout << "OMPL version: " << OMPL_VERSION << std::endl;
-
-    // plan();
-    //
-    // std::cout << std::endl << std::endl;
-    //
-    planWithSimpleSetup();
-
+    plan();
     return 0;
 }
