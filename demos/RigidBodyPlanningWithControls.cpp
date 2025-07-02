@@ -40,6 +40,7 @@
 #include <ompl/control/spaces/RealVectorControlSpace.h>
 #include <ompl/control/planners/rrt/RRT.h>
 #include <ompl/control/planners/sst/SST.h>
+#include <ompl/base/PlannerTerminationCondition.h>
 #include <ompl/base/objectives/PathLengthOptimizationObjective.h>
 #include <ompl/config.h>
 #include <iostream>
@@ -282,7 +283,8 @@ void plan()
     // maximum allowed time is exceeded
     while (status != ob::PlannerStatus::StatusType::EXACT_SOLUTION)
     {
-        status = planner->ob::Planner::solve(increment);
+        auto ptc = ob::timedPlannerTerminationCondition(increment);
+        status = planner->solve(ptc);
         plan_time += increment;
         if (plan_time > max_plan_time) break;
     }
