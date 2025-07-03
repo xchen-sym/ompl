@@ -37,3 +37,12 @@ following commands:
     # next step is optional
     make -j 4 update_bindings # if you want Python bindings
     make -j 4 # replace "4" with the number of cores on your machine
+
+## Run visualization.py
+After building successfully in cpp, run in main directory:
+
+```
+./build/demos/demo_RigidBodyPlanningWithControls > logs/test.log 2>&1
+
+python visualization.py
+```
