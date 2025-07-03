@@ -60,9 +60,10 @@ class GoalWeighted : public ob::GoalRegion
 public:
     GoalWeighted(const ob::SpaceInformationPtr &si,
                  const ob::ScopedState<ob::CompoundStateSpace> &goalState,
-                 double tol, double w_pose, double w_vel)
-      : GoalRegion(si), goal_(goalState), tol_(tol),
-        w_pose_(w_pose), w_vel_(w_vel)
+                 double tol, double w_x, double w_y, double w_yaw,
+                 double w_v, double w_omega)
+      : GoalRegion(si), goal_(goalState), tol_(tol), w_x_(w_x),
+        w_y_(w_y), w_yaw_(w_yaw), w_v_(w_v), w_omega_(w_omega)
     {
         // Goal is satisfied when distanceGoal < threshold_
         setThreshold(0.0);
@@ -83,15 +84,15 @@ public:
         // 2) compute pose error
         double dx = se2_s->getX() - se2_g->getX();
         double dy = se2_s->getY() - se2_g->getY();
-        double dth = se2_s->getYaw() - se2_g->getYaw();
+        double dyaw = se2_s->getYaw() - se2_g->getYaw();
 
         // 3) compute vel error
         double dv = vel_s->values[0] - vel_g->values[0];
         double domega = vel_s->values[1] - vel_g->values[1];
 
         // 4) weighted combination
-        double metric = std::sqrt(w_pose_ * (dx * dx + dy * dy + dth * dth) + 
-                                  w_vel_ * (dv * dv + domega * domega));
+        double metric = std::sqrt(w_x_ * dx * dx + w_y_ * dy * dy + w_yaw_ * dyaw * dyaw +
+                                  w_v_ * dv * dv + w_omega_ * domega * domega);
         
         std::cout << "metric = " << metric << std::endl;
 
@@ -100,7 +101,7 @@ public:
 
 private:
     ob::ScopedState<ob::CompoundStateSpace> goal_;
-    double tol_, w_pose_, w_vel_;
+    double tol_, w_x_, w_y_, w_yaw_, w_v_, w_omega_;
 };
 
 
@@ -255,13 +256,14 @@ void plan()
     // 4) ProblemDefinition + Optimization
     auto pdef(std::make_shared<ob::ProblemDefinition>(si));
     // pdef->setStartAndGoalStates(start, goal, 0.05);
+
     pdef->addStartState(start);
-    // customize position and velocity weights
-    {
-        double tol = 0.1, w_pose = 1.0, w_vel = 0.0;
-        auto weighted_goal = std::make_shared<GoalWeighted>(si, goal, tol, w_pose, w_vel);
-        pdef->setGoal(weighted_goal);
-    }
+    // customize each state's weight while setting convergence target
+    double tol = 0.1, w_x = 1.0, w_y = 1.0, w_yaw = 1.0, w_v = 1.0, w_omega = 1.0;
+    auto weighted_goal = std::make_shared<GoalWeighted>(si, goal, tol, w_x, w_y,
+                                                        w_yaw, w_v, w_omega);
+    pdef->setGoal(weighted_goal);
+
     auto opt = std::make_shared<ob::PathLengthOptimizationObjective>(si);
     pdef->setOptimizationObjective(opt);
 
