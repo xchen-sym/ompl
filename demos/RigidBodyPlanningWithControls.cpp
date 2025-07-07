@@ -35,6 +35,8 @@
 /* Author: Ioan Sucan */
 
 #include <ompl/control/SpaceInformation.h>
+#include <ompl/base/Goal.h>
+#include <ompl/base/StateSpace.h>
 #include <ompl/base/goals/GoalState.h>
 #include <ompl/base/spaces/SE2StateSpace.h>
 #include <ompl/control/spaces/RealVectorControlSpace.h>
@@ -48,8 +50,6 @@
 #include <chrono>
 #include <vector>
 #include <Eigen/Dense>
-#include <ompl/base/Goal.h>
-#include <ompl/base/StateSpace.h>
 
 namespace ob = ompl::base;
 namespace oc = ompl::control;
@@ -59,11 +59,10 @@ class GoalWeighted : public ob::GoalRegion
 {
 public:
     GoalWeighted(const ob::SpaceInformationPtr &si,
-                 const ob::ScopedState<ob::CompoundStateSpace> &goalState,
-                 double tol, double w_x, double w_y, double w_yaw,
-                 double w_v, double w_omega)
-      : GoalRegion(si), goal_(goalState), tol_(tol), w_x_(w_x),
-        w_y_(w_y), w_yaw_(w_yaw), w_v_(w_v), w_omega_(w_omega)
+                 const ob::ScopedState<ob::SE2StateSpace> &goalState,
+                 double tol, double w_x, double w_y, double w_yaw)
+      : GoalRegion(si), goal_(goalState), tol_(tol),
+        w_x_(w_x), w_y_(w_y), w_yaw_(w_yaw)
     {
         // Goal is satisfied when distanceGoal < threshold_
         setThreshold(0.0);
@@ -72,27 +71,17 @@ public:
     // Override to use our own weighted metric
     double distanceGoal(const ob::State *s) const override
     {
-        // 1) unravel the compound state
-        const auto *cs = s->as<ob::CompoundStateSpace::StateType>();
-        auto *se2_s  = cs->as<ob::SE2StateSpace::StateType>(0);
-        auto *vel_s  = cs->as<ob::RealVectorStateSpace::StateType>(1);
+        // 1) unravel the current and goal state
+        const auto *current_state = s->as<ob::SE2StateSpace::StateType>();
+        const auto *goal_state = goal_.get();
 
-        const auto *csG = goal_.get();
-        auto *se2_g  = csG->as<ob::SE2StateSpace::StateType>(0);
-        auto *vel_g  = csG->as<ob::RealVectorStateSpace::StateType>(1);
-
-        // 2) compute pose error
-        double dx = se2_s->getX() - se2_g->getX();
-        double dy = se2_s->getY() - se2_g->getY();
-        double dyaw = se2_s->getYaw() - se2_g->getYaw();
-
-        // 3) compute vel error
-        double dv = vel_s->values[0] - vel_g->values[0];
-        double domega = vel_s->values[1] - vel_g->values[1];
+        // 2) compute state error
+        double dx = current_state->getX() - goal_state->getX();
+        double dy = current_state->getY() - goal_state->getY();
+        double dyaw = current_state->getYaw() - goal_state->getYaw();
 
         // 4) weighted combination
-        double metric = std::sqrt(w_x_ * dx * dx + w_y_ * dy * dy + w_yaw_ * dyaw * dyaw +
-                                  w_v_ * dv * dv + w_omega_ * domega * domega);
+        double metric = std::sqrt(w_x_ * dx * dx + w_y_ * dy * dy + w_yaw_ * dyaw * dyaw);
         
         std::cout << "metric = " << metric << std::endl;
 
@@ -100,8 +89,8 @@ public:
     }
 
 private:
-    ob::ScopedState<ob::CompoundStateSpace> goal_;
-    double tol_, w_x_, w_y_, w_yaw_, w_v_, w_omega_;
+    ob::ScopedState<ob::SE2StateSpace> goal_;
+    double tol_, w_x_, w_y_, w_yaw_;
 };
 
 
@@ -151,73 +140,47 @@ void propagate(const ob::State *start, const oc::Control *control,
                const double duration, ob::State *result)
 {
     // 1) Read current state and control values
-    const auto *state = start->as<ob::CompoundStateSpace::StateType>();
-
-    const auto *pos = state->as<ob::SE2StateSpace::StateType>(0);
+    const auto *pos = start->as<ob::SE2StateSpace::StateType>();
     double x = pos->getX(), y = pos->getY(), yaw = pos->getYaw();
 
-    const auto *vel = state->as<ob::RealVectorStateSpace::StateType>(1);
+    const auto *vel = control->as<oc::RealVectorControlSpace::ControlType>();
     double v = vel->values[0], omega = vel->values[1];
 
-    const auto *acc = control->as<oc::RealVectorControlSpace::ControlType>();
-    double a = acc->values[0], alpha = acc->values[1];
-
     // 2) Propagation
-    double x_new = x + (v * duration + 0.5 * a * duration * duration) * cos(yaw);
-    double y_new = y + (v * duration + 0.5 * a * duration * duration) * sin(yaw);
-    double yaw_new = yaw + omega * duration + 0.5 * alpha * duration * duration;
-    double v_new = v + a * duration;
-    double omega_new = omega + alpha * duration;
+    double x_new = x + v * duration * cos(yaw);
+    double y_new = y + v * duration * sin(yaw);
+    double yaw_new = yaw + omega * duration;
 
     std::cout << std::fixed << std::setprecision(4);
-    std::cout << "Before Propagation:" << " x = " << x << " y = " << y << " yaw = " << yaw
-              << " v = " << v << " omega = " << omega << std::endl;
-    std::cout << "Propagation Acceleration:" << " a = " << a << " alpha = " << alpha << std::endl;
-    std::cout << "After Propagation:" << " x = " << x_new << " y = " << y_new << " yaw = " << yaw_new
-              << " v = " << v_new << " omega = " << omega_new << std::endl;
+    std::cout << "Before Propagation:" << " x = " << x << " y = " << y 
+              << " yaw = " << yaw << std::endl;
+    std::cout << "Propagation Acceleration:" << " v = " << v << " omega = " << omega << std::endl;
+    std::cout << "After Propagation:" << " x = " << x_new << " y = " << y_new 
+              << " yaw = " << yaw_new << std::endl;
     std::cout << std::endl;
 
     // 3) Write into result
-    auto *state_new = result->as<ob::CompoundStateSpace::StateType>();
-
-    auto *pos_new = state_new->as<ob::SE2StateSpace::StateType>(0);
+    auto *pos_new = result->as<ob::SE2StateSpace::StateType>();
     pos_new->setX(x_new);
     pos_new->setY(y_new);
     pos_new->setYaw(yaw_new);
-
-    auto *vel_new = state_new->as<ob::RealVectorStateSpace::StateType>(1);
-    vel_new->values[0] = v_new;
-    vel_new->values[1] = omega_new;
 }
 
 void plan()
 {
     // 1) Set state and control spaces
-    // set position space, including (x, y, yaw)
-    auto pos_space(std::make_shared<ob::SE2StateSpace>());
-    ob::RealVectorBounds pos_bounds(2);
-    pos_bounds.setLow(0, 0.0); pos_bounds.setHigh(0, 1.0); // x position bound [0, 1]
-    pos_bounds.setLow(1, 0.0); pos_bounds.setHigh(1, 1.0); // y position bound [0, 1]
-    pos_space->setBounds(pos_bounds);
+    // set state space, including (x, y, yaw)
+    auto space(std::make_shared<ob::SE2StateSpace>());
+    ob::RealVectorBounds bounds(2);
+    bounds.setLow(0, 0.0); bounds.setHigh(0, 1.0); // x position bound [0, 1]
+    bounds.setLow(1, 0.0); bounds.setHigh(1, 1.0); // y position bound [0, 1]
+    space->setBounds(bounds);
 
-    // set velocity space, including (v, omega)
-    auto vel_space(std::make_shared<ob::RealVectorStateSpace>(2));
-    ob::RealVectorBounds vel_bounds(2);
-    vel_bounds.setLow(0, 0.0); vel_bounds.setHigh(0, 4.0);  // linear velocity bound [0, 4.0]
-    vel_bounds.setLow(1, -1.5); vel_bounds.setHigh(1, 1.5); // angular velocity bound [-3.0, 3.0]
-    vel_space->setBounds(vel_bounds);
-
-    // set general state space, including pos_space and vel_space
-    auto space(std::make_shared<ob::CompoundStateSpace>());
-    space->addSubspace(pos_space, 1.0);
-    space->addSubspace(vel_space, 1.0);
-    space->lock();
-
-    // set control (acceleration) space, including (a, alpha)
+    // set control (velocity) space, including (v, omega)
     auto cspace(std::make_shared<oc::RealVectorControlSpace>(space, 2));
     ob::RealVectorBounds cbounds(2);
-    cbounds.setLow(0, -1.5); cbounds.setHigh(0, 1.5); // linear acceleration bound [-1.5, 1.5]
-    cbounds.setLow(1, -3.0); cbounds.setHigh(1, 3.0); // angular acceleration bound [-1.5, 1.5]
+    cbounds.setLow(0, 0.0); cbounds.setHigh(0, 2.0); // linear velocity bound [0.0, 2.0]
+    cbounds.setLow(1, -1.5); cbounds.setHigh(1, 1.5); // angular velocity bound [-1.5, 1.5]
     cspace->setBounds(cbounds);
 
     // 2) SpaceInformation
@@ -229,29 +192,15 @@ void plan()
     si->setStatePropagator(propagate);
 
     // 3) Start & Goal
-    ob::ScopedState<ob::CompoundStateSpace> start(space), goal(space);
+    ob::ScopedState<ob::SE2StateSpace> start(space), goal(space);
 
-    auto *space_start = start.get();
+    start->setX(0.0);
+    start->setY(0.685);
+    start->setYaw(-1.570796);
 
-    auto *pos_space_start = space_start->as<ob::SE2StateSpace::StateType>(0);
-    pos_space_start->setX(0.0);
-    pos_space_start->setY(0.685);
-    pos_space_start->setYaw(-1.570796);
-
-    auto *vel_space_start = space_start->as<ob::RealVectorStateSpace::StateType>(1);
-    vel_space_start->values[0] = 0.528379;
-    vel_space_start->values[1] = 0.0;
-
-    auto *space_goal = goal.get();
-
-    auto *pos_space_goal = space_goal->as<ob::SE2StateSpace::StateType>(0);
-    pos_space_goal->setX(0.86329);
-    pos_space_goal->setY(0.0);
-    pos_space_goal->setYaw(0.0);
-
-    auto *vel_space_goal = space_goal->as<ob::RealVectorStateSpace::StateType>(1);
-    vel_space_goal->values[0] = 0.930091;
-    vel_space_goal->values[1] = 0.0;
+    goal->setX(0.86329);
+    goal->setY(0.0);
+    goal->setYaw(0.0);
 
     // 4) ProblemDefinition + Optimization
     auto pdef(std::make_shared<ob::ProblemDefinition>(si));
@@ -259,9 +208,9 @@ void plan()
 
     pdef->addStartState(start);
     // customize each state's weight while setting convergence target
-    double tol = 0.1, w_x = 1.0, w_y = 1.0, w_yaw = 1.0, w_v = 1.0, w_omega = 1.0;
-    auto weighted_goal = std::make_shared<GoalWeighted>(si, goal, tol, w_x, w_y,
-                                                        w_yaw, w_v, w_omega);
+    double tol = 0.05, w_x = 1.0, w_y = 1.0, w_yaw = 1.0;
+    auto weighted_goal = std::make_shared<GoalWeighted>(
+        si, goal, tol, w_x, w_y, w_yaw);
     pdef->setGoal(weighted_goal);
 
     auto opt = std::make_shared<ob::PathLengthOptimizationObjective>(si);
