@@ -196,7 +196,7 @@ TrajectoryGenerator::TrajectoryGenerator(const Waypoint &start,
     setPropagation();
     setBoundingBoxConstraints();
     setStartAndGoal();
-    setPlanner();
+    setPlanner();    
 };
 
 void TrajectoryGenerator::setStateAndControlSpace()
@@ -299,14 +299,30 @@ ob::PlannerStatus TrajectoryGenerator::plan()
     if (status == ob::PlannerStatus::EXACT_SOLUTION)
     {
         // store path profiles
-        auto ctlPath = std::dynamic_pointer_cast<oc::PathControl>(path);
+        auto ctrlPath = std::dynamic_pointer_cast<oc::PathControl>(path);
         pathProfiles_.clear();
-        pathProfiles_.reserve(ctlPath->getStateCount());
-        for (std::size_t i = 0; i < ctlPath->getStateCount(); ++i)
+        // 1) store the first path point
+        const auto *s0 = ctrlPath->getState(0)->as<ob::SE2StateSpace::StateType>();
+        pathProfiles_.emplace_back(s0->getX(), s0->getY(), s0->getYaw());
+        // 2) replay every control step
+        for (std::size_t i = 0; i < ctrlPath->getControlCount(); ++i)
         {
-            const auto *st = ctlPath->getState(i)
-                                    ->as<ob::SE2StateSpace::StateType>();
-            pathProfiles_.emplace_back(st->getX(), st->getY(), st->getYaw());
+            const auto* control = ctrlPath->getControl(i);
+            unsigned int numSteps = std::round(ctrlPath->getControlDuration(i) / ctrl_dt_);
+
+            ob::State *prev = si_->allocState();
+            si_->copyState(prev, ctrlPath->getState(i));
+
+            for (unsigned int s = 0; s < numSteps; ++s)
+            {
+                ob::State *next = si_->allocState();
+                propagate(prev, control, ctrl_dt_, next);
+                const auto *st = next->as<ob::SE2StateSpace::StateType>();
+                pathProfiles_.emplace_back(st->getX(), st->getY(), st->getYaw());
+                si_->freeState(prev);
+                prev = next;
+            }
+            si_->freeState(prev);
         }
 
         std::cout << "Found solution:" << std::endl;
