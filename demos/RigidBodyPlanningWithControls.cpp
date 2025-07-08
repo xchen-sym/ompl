@@ -45,16 +45,54 @@
 #include <ompl/base/PlannerTerminationCondition.h>
 #include <ompl/base/objectives/PathLengthOptimizationObjective.h>
 #include <ompl/config.h>
+#include <Eigen/Core>
+#include <Eigen/Dense>
 #include <iostream>
 #include <iomanip>
 #include <chrono>
 #include <vector>
-#include <Eigen/Dense>
 
 namespace ob = ompl::base;
 namespace oc = ompl::control;
 
-// A GoalRegion that uses custom weights (w_pose, w_vel) only for the goal check.
+struct Waypoint {
+    double x, y, yaw;
+};
+
+struct BoundingBox {
+    double minX, maxX, minY, maxY;
+};
+
+void propagate(const ob::State *start, const oc::Control *control,
+               const double duration, ob::State *result)
+{
+    // 1) Read current state and control values
+    const auto *pos = start->as<ob::SE2StateSpace::StateType>();
+    double x = pos->getX(), y = pos->getY(), yaw = pos->getYaw();
+
+    const auto *vel = control->as<oc::RealVectorControlSpace::ControlType>();
+    double v = vel->values[0], omega = vel->values[1];
+
+    // 2) Propagation
+    double x_new = x + v * duration * cos(yaw);
+    double y_new = y + v * duration * sin(yaw);
+    double yaw_new = yaw + omega * duration;
+
+    // std::cout << std::fixed << std::setprecision(4);
+    // std::cout << "Before Propagation:" << " x = " << x << " y = " << y 
+    //           << " yaw = " << yaw << std::endl;
+    // std::cout << "Propagation Acceleration:" << " v = " << v << " omega = " << omega << std::endl;
+    // std::cout << "After Propagation:" << " x = " << x_new << " y = " << y_new 
+    //           << " yaw = " << yaw_new << std::endl;
+    // std::cout << std::endl;
+
+    // 3) Write into result
+    auto *pos_new = result->as<ob::SE2StateSpace::StateType>();
+    pos_new->setX(x_new);
+    pos_new->setY(y_new);
+    pos_new->setYaw(yaw_new);
+}
+
 class GoalWeighted : public ob::GoalRegion
 {
 public:
@@ -83,7 +121,7 @@ public:
         // 4) weighted combination
         double metric = std::sqrt(w_x_ * dx * dx + w_y_ * dy * dy + w_yaw_ * dyaw * dyaw);
         
-        std::cout << "metric = " << metric << std::endl;
+        // std::cout << "metric = " << metric << std::endl;
 
         return metric - tol_;
     }
@@ -93,176 +131,244 @@ private:
     double tol_, w_x_, w_y_, w_yaw_;
 };
 
-
-struct AABB
+class TrajectoryGenerator
 {
-    Eigen::Vector2d min, max;
-    bool contains(const Eigen::Vector2d &p) const
-    {
-        return (p.x() >= min.x() && p.x() <= max.x()) &&
-               (p.y() >= min.y() && p.y() <= max.y());
-    }
+private:
+    Waypoint start_, goal_;
+    std::vector<BoundingBox> allowedBoxes_;
+    const std::vector<Eigen::Vector2d> bodyPoints_;
+
+    BoundingBox posBounds_;
+    const double maxV_;
+    const double maxOmega_;
+
+    const double ctrl_dt_; // control cycle time
+    const double tol_, w_x_, w_y_, w_yaw_; // goal convergence tolerance and weights
+    const double plan_dt_, plan_time_; // planning incremental and total time
+
+    std::vector<Eigen::Vector3d> pathProfiles_;
+
+    oc::SpaceInformationPtr si_;
+    ob::ProblemDefinitionPtr pdef_;
+    std::shared_ptr<oc::SST> planner_;
+
+    void setStateAndControlSpace();
+    void setPropagation();
+    void setBoundingBoxConstraints();
+    void setStartAndGoal();
+    void setPlanner();
+
+    bool stateValidityCheck(const ob::State *state);
+
+public:
+    TrajectoryGenerator(const Waypoint &start,
+                        const Waypoint &goal,
+                        const std::vector<BoundingBox> &allowed,
+                        const std::vector<Eigen::Vector2d> &bodyPts,
+                        const BoundingBox &posBounds,
+                        const double maxV, const double maxOmega,
+                        const double ctrl_dt, const double tol,
+                        const double w_x, const double w_y,
+                        const double w_yaw, const double plan_dt,
+                        const double plan_time);
+
+    ob::PlannerStatus plan();
+
+    const std::vector<Eigen::Vector3d>& getPathProfiles() const;
 };
 
-// Your allowed boxes and bodyPoints remain unchanged:
-static const std::vector<AABB> allowedBoxes = {
-    {{-0.414912, -0.933520}, {1.756473, -0.459736}},
-    {{-0.440026, -0.479736}, {2.079724, 0.038077}},
-    {{-0.452385, 0.018077}, {2.080080, 0.507299}},
-    {{-0.459443, 0.487299}, {0.452835, 0.989674}}
+TrajectoryGenerator::TrajectoryGenerator(const Waypoint &start,
+                                         const Waypoint &goal,
+                                         const std::vector<BoundingBox> &allowed,
+                                         const std::vector<Eigen::Vector2d> &bodyPts,
+                                         const BoundingBox &posBounds,
+                                         const double maxV, const double maxOmega,
+                                         const double ctrl_dt, const double tol,
+                                         const double w_x, const double w_y,
+                                         const double w_yaw, const double plan_dt,
+                                         const double plan_time)
+  : start_(start), goal_(goal), allowedBoxes_(allowed), bodyPoints_(bodyPts),
+    posBounds_(posBounds), maxV_(maxV), maxOmega_(maxOmega), ctrl_dt_(ctrl_dt), 
+    tol_(tol), w_x_(w_x), w_y_(w_y), w_yaw_(w_yaw), plan_dt_(plan_dt),
+    plan_time_(plan_time)
+{
+    setStateAndControlSpace();
+    setPropagation();
+    setBoundingBoxConstraints();
+    setStartAndGoal();
+    setPlanner();
 };
 
-static const std::vector<Eigen::Vector2d> bodyPoints = {
-    {-0.2545, 0.381},
-    {-0.2545, -0.381},
-    {1.16417, 0.381},
-    {1.16417, -0.381}
+void TrajectoryGenerator::setStateAndControlSpace()
+{
+    // 1) set state space, including [x, y, yaw]
+    auto sspace(std::make_shared<ob::SE2StateSpace>());
+    ob::RealVectorBounds sbounds(2);
+    sbounds.setLow(0, posBounds_.minX); sbounds.setHigh(0, posBounds_.maxX); // x position bound
+    sbounds.setLow(1, posBounds_.minY); sbounds.setHigh(1, posBounds_.maxY); // y position bound
+    sspace->setBounds(sbounds);
+
+    // 2) set control (velocity) space, including [v, omega]
+    auto cspace(std::make_shared<oc::RealVectorControlSpace>(sspace, 2));
+    ob::RealVectorBounds cbounds(2);
+    cbounds.setLow(0, 0.0); cbounds.setHigh(0, maxV_); // linear velocity v bound
+    cbounds.setLow(1, -maxOmega_); cbounds.setHigh(1, maxOmega_); // angular velocity omega bound
+    cspace->setBounds(cbounds);
+
+    // 3) set SpaceInformation + ProblemDefinition
+    si_ = std::make_shared<oc::SpaceInformation>(sspace, cspace);
+    pdef_ = std::make_shared<ob::ProblemDefinition>(si_);
 };
 
-bool isStateValid(const oc::SpaceInformation *si, const ob::State *state)
+void TrajectoryGenerator::setPropagation()
+{
+    si_->setPropagationStepSize(ctrl_dt_);
+    si_->setMinMaxControlDuration(1, 10);
+    si_->setStatePropagator(propagate);
+};
+
+bool TrajectoryGenerator::stateValidityCheck(const ob::State *state)
 {
     const auto *se2 = state->as<ob::SE2StateSpace::StateType>();
-    double x   = se2->getX(), y = se2->getY(), yaw = se2->getYaw();
+    double x = se2->getX(), y = se2->getY(), yaw = se2->getYaw();
     Eigen::Rotation2Dd R(yaw);
-    for (auto &pt_body : bodyPoints)
+    for (auto &pt_body : bodyPoints_)
     {
         Eigen::Vector2d w = R * pt_body + Eigen::Vector2d(x,y);
         bool insideAny = false;
-        for (auto &box : allowedBoxes)
-            if (box.contains(w)) { insideAny = true; break; }
+        for (auto &box : allowedBoxes_)
+            if (w.x() >= box.minX && w.x() <= box.maxX &&
+                w.y() >= box.minY && w.y() <= box.maxY)
+            { insideAny = true; break;}
         if (!insideAny)
             return false;
     }
-    return si->satisfiesBounds(state);
-}
+    return si_->satisfiesBounds(state);
+};
 
-void propagate(const ob::State *start, const oc::Control *control,
-               const double duration, ob::State *result)
+void TrajectoryGenerator::setBoundingBoxConstraints()
 {
-    // 1) Read current state and control values
-    const auto *pos = start->as<ob::SE2StateSpace::StateType>();
-    double x = pos->getX(), y = pos->getY(), yaw = pos->getYaw();
+    si_->setStateValidityChecker(
+        [&](const ob::State *state){ return stateValidityCheck(state); });
+};
 
-    const auto *vel = control->as<oc::RealVectorControlSpace::ControlType>();
-    double v = vel->values[0], omega = vel->values[1];
-
-    // 2) Propagation
-    double x_new = x + v * duration * cos(yaw);
-    double y_new = y + v * duration * sin(yaw);
-    double yaw_new = yaw + omega * duration;
-
-    std::cout << std::fixed << std::setprecision(4);
-    std::cout << "Before Propagation:" << " x = " << x << " y = " << y 
-              << " yaw = " << yaw << std::endl;
-    std::cout << "Propagation Acceleration:" << " v = " << v << " omega = " << omega << std::endl;
-    std::cout << "After Propagation:" << " x = " << x_new << " y = " << y_new 
-              << " yaw = " << yaw_new << std::endl;
-    std::cout << std::endl;
-
-    // 3) Write into result
-    auto *pos_new = result->as<ob::SE2StateSpace::StateType>();
-    pos_new->setX(x_new);
-    pos_new->setY(y_new);
-    pos_new->setYaw(yaw_new);
-}
-
-void plan()
+void TrajectoryGenerator::setStartAndGoal()
 {
-    // 1) Set state and control spaces
-    // set state space, including (x, y, yaw)
-    auto space(std::make_shared<ob::SE2StateSpace>());
-    ob::RealVectorBounds bounds(2);
-    bounds.setLow(0, 0.0); bounds.setHigh(0, 1.0); // x position bound [0, 1]
-    bounds.setLow(1, 0.0); bounds.setHigh(1, 1.0); // y position bound [0, 1]
-    space->setBounds(bounds);
+    ob::ScopedState<ob::SE2StateSpace> start(si_->getStateSpace()),
+                                       goal(si_->getStateSpace());
 
-    // set control (velocity) space, including (v, omega)
-    auto cspace(std::make_shared<oc::RealVectorControlSpace>(space, 2));
-    ob::RealVectorBounds cbounds(2);
-    cbounds.setLow(0, 0.0); cbounds.setHigh(0, 2.0); // linear velocity bound [0.0, 2.0]
-    cbounds.setLow(1, -1.5); cbounds.setHigh(1, 1.5); // angular velocity bound [-1.5, 1.5]
-    cspace->setBounds(cbounds);
+    start->setX(start_.x);
+    start->setY(start_.y);
+    start->setYaw(start_.yaw);
 
-    // 2) SpaceInformation
-    auto si(std::make_shared<oc::SpaceInformation>(space, cspace));
-    si->setPropagationStepSize(0.01);
-    // si->setMinMaxControlDuration(1, 1);
-    si->setStateValidityChecker(
-        [&](const ob::State *s){ return isStateValid(si.get(), s); }); // bounding box constraints
-    si->setStatePropagator(propagate);
+    goal->setX(goal_.x);
+    goal->setY(goal_.y);
+    goal->setYaw(goal_.yaw);
 
-    // 3) Start & Goal
-    ob::ScopedState<ob::SE2StateSpace> start(space), goal(space);
+    pdef_->addStartState(start);
+    auto w_goal = std::make_shared<GoalWeighted>(
+        si_, goal, tol_, w_x_, w_y_, w_yaw_);
+    pdef_->setGoal(w_goal);
 
-    start->setX(0.0);
-    start->setY(0.685);
-    start->setYaw(-1.570796);
+    auto opt = std::make_shared<ob::PathLengthOptimizationObjective>(si_);
+    pdef_->setOptimizationObjective(opt);
+};
 
-    goal->setX(0.86329);
-    goal->setY(0.0);
-    goal->setYaw(0.0);
+void TrajectoryGenerator::setPlanner()
+{
+    planner_ = std::make_shared<oc::SST>(si_);
+    planner_->setProblemDefinition(pdef_);
+    planner_->setup();
+};
 
-    // 4) ProblemDefinition + Optimization
-    auto pdef(std::make_shared<ob::ProblemDefinition>(si));
-    // pdef->setStartAndGoalStates(start, goal, 0.05);
-
-    pdef->addStartState(start);
-    // customize each state's weight while setting convergence target
-    double tol = 0.05, w_x = 1.0, w_y = 1.0, w_yaw = 1.0;
-    auto weighted_goal = std::make_shared<GoalWeighted>(
-        si, goal, tol, w_x, w_y, w_yaw);
-    pdef->setGoal(weighted_goal);
-
-    auto opt = std::make_shared<ob::PathLengthOptimizationObjective>(si);
-    pdef->setOptimizationObjective(opt);
-
-    // 5) Use SST for near-optimal kinodynamic planning
-    // auto planner(std::make_shared<oc::RRT>(si));
-    auto planner = std::make_shared<oc::SST>(si);
-    planner->setProblemDefinition(pdef);
-    planner->setup();
-
-    // 6) Solve
-    si->printSettings(std::cout);
-    pdef->print(std::cout);
-
+ob::PlannerStatus TrajectoryGenerator::plan()
+{
     ob::PlannerStatus status;
-    const double increment = 0.002;
-    const double max_plan_time = 2.0;
-    double plan_time = 0.0;
-    // Planning incrementally until solver finds a solution or
-    // maximum allowed time is exceeded
-    while (status != ob::PlannerStatus::StatusType::EXACT_SOLUTION)
+    double t = 0.0;
+
+    // incremental planning until solution is found or max time is exceeded
+    while (status != ob::PlannerStatus::EXACT_SOLUTION)
     {
-        auto ptc = ob::timedPlannerTerminationCondition(increment);
-        status = planner->solve(ptc);
-        plan_time += increment;
-        if (plan_time > max_plan_time) break;
+        auto ptc = ob::timedPlannerTerminationCondition(plan_dt_);
+        status = planner_->solve(ptc);
+        t += plan_dt_;
+        if (t > plan_time_) break;
     }
 
-    auto path = pdef->getSolutionPath();
-    if (status == ob::PlannerStatus::StatusType::EXACT_SOLUTION)
+    auto path = pdef_->getSolutionPath();
+    if (status == ob::PlannerStatus::EXACT_SOLUTION)
     {
+        // store path profiles
+        auto ctlPath = std::dynamic_pointer_cast<oc::PathControl>(path);
+        pathProfiles_.clear();
+        pathProfiles_.reserve(ctlPath->getStateCount());
+        for (std::size_t i = 0; i < ctlPath->getStateCount(); ++i)
+        {
+            const auto *st = ctlPath->getState(i)
+                                    ->as<ob::SE2StateSpace::StateType>();
+            pathProfiles_.emplace_back(st->getX(), st->getY(), st->getYaw());
+        }
+
         std::cout << "Found solution:" << std::endl;
         path->print(std::cout);
-        std::cout << "Planning took " << plan_time << " seconds\n";
+        std::cout << "Planning took " << t << " seconds\n";
         std::cout << "Planner status: " << status << std::endl;
     }
     else
     {
         std::cout << "No solution found\n";
-        if (status == ob::PlannerStatus::StatusType::APPROXIMATE_SOLUTION)
+        if (status == ob::PlannerStatus::APPROXIMATE_SOLUTION)
         {
             std::cout << "Found approximate solution:" << std::endl;
             path->print(std::cout);
         }
         std::cout << "Planner status: " << status << std::endl;
     }
-}
+
+    return status;
+};
+
+const std::vector<Eigen::Vector3d>& TrajectoryGenerator::getPathProfiles() const
+{
+    return pathProfiles_;
+};
 
 int main()
 {
-    std::cout << "OMPL version: " << OMPL_VERSION << std::endl;
-    plan();
+    const Waypoint start{0.0, 0.685, -1.570796};
+    const Waypoint goal{0.86329, 0.0, 0.0};
+    const std::vector<BoundingBox> allowed = {
+        {-0.414912, 1.756473, -0.933520, -0.459736},
+        {-0.440026, 2.079724, -0.479736, 0.038077},
+        {-0.452385, 2.080080, 0.018077, 0.507299},
+        {-0.459443, 0.452835, 0.487299, 0.989674}
+    };
+    const std::vector<Eigen::Vector2d> bodyPts = {
+        {-0.2545, 0.381},
+        {-0.2545, -0.381},
+        {1.16417, 0.381},
+        {1.16417, -0.381}
+    };
+    const BoundingBox posBounds = {0.0, 1.0, 0.0, 1.0};
+    const double maxV = 2.0, maxOmega = 1.5, ctrl_dt = 0.01, tol = 0.05,
+        w_x = 1.0, w_y = 1.0, w_yaw = 1.0, plan_dt = 0.002, plan_time = 2.0;
+
+    TrajectoryGenerator tg(start, goal, allowed, bodyPts, posBounds,
+                           maxV, maxOmega, ctrl_dt, tol, w_x, w_y,
+                           w_yaw, plan_dt, plan_time);
+
+    ob::PlannerStatus status = tg.plan();
+    if (status == ob::PlannerStatus::EXACT_SOLUTION)
+    {
+        const auto &traj = tg.getPathProfiles();
+        std::cout << "Trajectory:" << std::endl;
+        for (const auto &v : traj)
+            std::cout << "[" << v.x() << ", " << v.y() << ", " << v.z() << "]" << std::endl;
+        std::cout << "Planning successful." << std::endl;
+    }
+    else
+    {
+        std::cout << "Planning failed." << std::endl;
+    }
     return 0;
-}
+};
