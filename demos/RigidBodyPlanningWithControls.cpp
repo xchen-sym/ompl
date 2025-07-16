@@ -361,12 +361,17 @@ void TrajectoryGenerator::KinematicSimulation()
     // store start waypoint
     trajectoryPoints_.clear();
     trajectoryPoints_.emplace_back(start_);
-
     Waypoint wp = start_;
     current_path_idx_ = 0;  // Reset path index
     const double lookahead_dist = 0.1;  // Lookahead distance for path following
 
-    for (int step = 0; step < 400; ++step)
+    // Track minimum error within tol_
+    double min_error = std::numeric_limits<double>::max();
+    bool found_valid_solution = false;
+
+    // Real trajectory time length should not be too long. Here it is set within
+    // 2 * reference trajectory length.
+    for (std::size_t step = 0; step < 2 * pathProfiles_.size(); ++step)
     {
         // Find closest path point index and update current_path_idx_
         int closest_idx = 0;
@@ -422,24 +427,46 @@ void TrajectoryGenerator::KinematicSimulation()
         double dv = std::clamp(v_ref - wp.v, -a_max_ * ctrl_dt_, a_max_ * ctrl_dt_);
         wp.v = std::clamp(wp.v + dv, 0.0, v_max_);
         
-        // Angular control using Pure Pursuit-like approach
-        double target_x = pathProfiles_[target_idx][0];
-        double target_y = pathProfiles_[target_idx][1];
+        double omega_tgt = 0.0;
+        double kp_angular = 10.0;  // Proportional gain for yaw control
+        
+        // When close to goal, blend between path following and goal alignment
+        const double goal_approach_dist = 0.2;  // Distance threshold for goal approach behavior
+        if (dist_to_goal < goal_approach_dist)
+        {
+            // Calculate blend factor based on distance to goal (0 = far, 1 = at goal)
+            double blend_factor = 1.0 - (dist_to_goal / goal_approach_dist);
+            blend_factor = std::clamp(blend_factor, 0.0, 1.0);
+            
+            // Calculate angular error for path following
+            double yaw_error = goal_.yaw - wp.yaw;
+            while (yaw_error > M_PI) yaw_error -= 2.0 * M_PI;
+            while (yaw_error < -M_PI) yaw_error += 2.0 * M_PI;
+            
+            // Calculate target angular velocity for path following
+            double omega_pos = kp_angular * yaw_error;
+            
+            // Blend between path-following omega and goal omega
+            omega_tgt = (1.0 - blend_factor) * omega_pos + blend_factor * goal_.omega;
+        }
+        else
+        {
+            // Normal path following behavior, bot should head towards reference point.
+            double target_x = pathProfiles_[target_idx][0];
+            double target_y = pathProfiles_[target_idx][1];
+            double yaw_tgt_pos = std::atan2(target_y - wp.y, target_x - wp.x);
+        
+            double yaw_error = yaw_tgt_pos - wp.yaw;
+            while (yaw_error > M_PI) yaw_error -= 2.0 * M_PI;
+            while (yaw_error < -M_PI) yaw_error += 2.0 * M_PI;
 
-        // Calculate desired heading to target point
-        double desired_yaw = std::atan2(target_y - wp.y, target_x - wp.x);
-        
-        // Calculate angular error with proper wrapping
-        double yaw_error = desired_yaw - wp.yaw;
-        while (yaw_error > M_PI) yaw_error -= 2.0 * M_PI;
-        while (yaw_error < -M_PI) yaw_error += 2.0 * M_PI;
-        
-        // Use proportional control for angular velocity with gain
-        double kp_angular = 10.0;  // Proportional gain
-        double target_omega = kp_angular * yaw_error;
+            // Calculate target angular velocity for path following
+            omega_tgt = kp_angular * yaw_error;
+        }
         
         // Apply angular acceleration constraints
-        double domega = std::clamp(target_omega - wp.omega, -alpha_max_ * ctrl_dt_, alpha_max_ * ctrl_dt_);
+        double domega = std::clamp(
+            omega_tgt - wp.omega, -alpha_max_ * ctrl_dt_, alpha_max_ * ctrl_dt_);
         wp.omega = std::clamp(wp.omega + domega, -omega_max_, omega_max_);
 
         // status update
@@ -451,16 +478,25 @@ void TrajectoryGenerator::KinematicSimulation()
         while (wp.yaw > M_PI) wp.yaw -= 2.0 * M_PI;
         while (wp.yaw < -M_PI) wp.yaw += 2.0 * M_PI;
 
+        // Check if this is the best waypoint so far
+        double pos_error = std::hypot(wp.x - goal_.x, wp.y - goal_.y);
+        double yaw_error = wp.yaw - goal_.yaw;
+        while (yaw_error > M_PI) yaw_error -= 2.0 * M_PI;
+        while (yaw_error < -M_PI) yaw_error += 2.0 * M_PI; 
+        double total_error = std::hypot(pos_error, yaw_error);
+        
+        // Track minimum error that's within tolerance
+        if (total_error < tol_ && total_error < min_error)
+        {
+            min_error = total_error;
+            found_valid_solution = true;
+        }
+        
+        // Early stopping: Break if we have a valid solution and error is increasing
+        if (found_valid_solution && total_error > min_error) break;
+
         // store trajectory points
         trajectoryPoints_.emplace_back(wp);
-
-        // early stop when goal region is reached
-        double pos_error = std::hypot(wp.x - goal_.x, wp.y - goal_.y);
-        double yaw_error_goal = wp.yaw - goal_.yaw;
-        while (yaw_error_goal > M_PI) yaw_error_goal -= 2.0 * M_PI;
-        while (yaw_error_goal < -M_PI) yaw_error_goal += 2.0 * M_PI; 
-        if (std::hypot(pos_error, yaw_error_goal) < tol_)
-            break;
     }
 }
 
