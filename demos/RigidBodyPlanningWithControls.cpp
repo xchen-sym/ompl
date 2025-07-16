@@ -185,6 +185,8 @@ public:
     const std::vector<Eigen::Vector3d>& getPathProfiles() const;
 
     const std::vector<Waypoint>& getTrajectoryPoints() const;
+
+    const std::pair<Waypoint, Waypoint> getInitialAndFinalWaypoints() const;
 };
 
 TrajectoryGenerator::TrajectoryGenerator(const Waypoint &start,
@@ -510,6 +512,11 @@ const std::vector<Waypoint>& TrajectoryGenerator::getTrajectoryPoints() const
     return trajectoryPoints_;
 };
 
+const std::pair<Waypoint, Waypoint> TrajectoryGenerator::getInitialAndFinalWaypoints() const
+{
+    return std::make_pair(start_, goal_);
+}
+
 int main()
 {
     const Waypoint start{0.0, 0.685, -1.570796, 0.528379, 0.0};
@@ -538,6 +545,16 @@ int main()
     ob::PlannerStatus status = tg.plan();
     if (status == ob::PlannerStatus::EXACT_SOLUTION)
     {
+        // Print initial and final waypoints
+        const auto waypoints = tg.getInitialAndFinalWaypoints();
+        std::cout << "Initial Waypoint: [" << waypoints.first.x << ", " << waypoints.first.y 
+                  << ", " << waypoints.first.yaw << ", " << waypoints.first.v 
+                  << ", " << waypoints.first.omega << "]" << std::endl;
+        std::cout << "Final Waypoint: [" << waypoints.second.x << ", " << waypoints.second.y 
+                  << ", " << waypoints.second.yaw << ", " << waypoints.second.v 
+                  << ", " << waypoints.second.omega << "]" << std::endl;
+        std::cout << std::endl;
+
         const auto &path = tg.getPathProfiles();
         std::cout << "Path:" << std::endl;
         for (const auto &p : path)
